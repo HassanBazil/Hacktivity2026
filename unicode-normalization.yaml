@@ -1,0 +1,220 @@
+rules:
+  # ---------------------------------------------------------------------------
+  # 1. Untrusted input reaches a validation / allowlist check with no
+  #    Unicode normalization anywhere on the path.
+  # ---------------------------------------------------------------------------
+  - id: go-input-validation-missing-unicode-normalization
+    mode: taint
+    languages: [go]
+    severity: WARNING
+    message: >-
+      Untrusted input reaches a validation, allowlist or identity check without
+      being Unicode-normalized first. Canonically-equivalent inputs (e.g. U+00E9E
+      vs "e" + U+0301) and compatibility characters (e.g. U+FF41 FULLWIDTH LATIN
+      SMALL LETTER A, U+017F LATIN SMALL LETTER LONG S) have different byte
+      sequences but can compare or render as equal downstream, allowing filter
+      bypass and identity spoofing. Normalize with
+      golang.org/x/text/unicode/norm (NFC for storage/comparison, NFKC when
+      folding compatibility variants) or golang.org/x/text/secure/precis for
+      usernames and passwords BEFORE validating.
+    options:
+      symbolic_propagation: true
+    metadata:
+      category: security
+      subcategory: [audit]
+      confidence: MEDIUM
+      likelihood: MEDIUM
+      impact: MEDIUM
+      technology: [go]
+      cwe:
+        - "CWE-176: Improper Handling of Unicode Encoding"
+        - "CWE-180: Incorrect Behavior Order: Validate Before Canonicalize"
+        - "CWE-20: Improper Input Validation"
+      owasp:
+        - "A03:2021 - Injection"
+      references:
+        - https://unicode.org/reports/tr15/
+        - https://unicode.org/reports/tr36/
+        - https://pkg.go.dev/golang.org/x/text/unicode/norm
+        - https://pkg.go.dev/golang.org/x/text/secure/precis
+    pattern-sources:
+      - pattern-either:
+          # net/http
+          - pattern: $R.FormValue(...)
+          - pattern: $R.PostFormValue(...)
+          - pattern: $R.Form.Get(...)
+          - pattern: $R.PostForm.Get(...)
+          - pattern: $R.URL.Query().Get(...)
+          - pattern: $R.Header.Get(...)
+          - pattern: $R.URL.Path
+          - pattern: $R.URL.RawQuery
+          - pattern: $R.PathValue(...)
+          # routers: gorilla/mux, chi, gin, echo, fiber
+          - pattern: mux.Vars($R)[$K]
+          - pattern: chi.URLParam($R, ...)
+          - pattern: $C.Param(...)
+          - pattern: $C.Query(...)
+          - pattern: $C.PostForm(...)
+          - pattern: $C.FormValue(...)
+          # raw bodies
+          - pattern: io.ReadAll($R.Body)
+          - pattern: ioutil.ReadAll($R.Body)
+      # decoded request bodies taint the destination struct
+      - patterns:
+          - pattern-either:
+              - pattern: json.NewDecoder($R.Body).Decode(&$X)
+              - pattern: json.Unmarshal($DATA, &$X)
+          - focus-metavariable: $X
+        by-side-effect: true
+    pattern-sanitizers:
+      - pattern-either:
+          # golang.org/x/text/unicode/norm
+          - pattern: norm.$FORM.String(...)
+          - pattern: norm.$FORM.Bytes(...)
+          - pattern: norm.$FORM.Append(...)
+          - pattern: norm.$FORM.AppendString(...)
+          - pattern: norm.$FORM.Reader(...)
+          # golang.org/x/text/secure/precis (usernames, passwords, nicknames)
+          - pattern: precis.$PROFILE.String(...)
+          - pattern: precis.$PROFILE.Bytes(...)
+          - pattern: precis.$PROFILE.CompareKey(...)
+          - pattern: $P.NewIdentifier(...).String(...)
+          - pattern: $P.NewFreeform(...).String(...)
+          # IDNA / case folding
+          - pattern: idna.$PROFILE.ToASCII(...)
+          - pattern: idna.$PROFILE.ToUnicode(...)
+          - pattern: idna.ToASCII(...)
+          - pattern: idna.ToUnicode(...)
+          - pattern: cases.Fold(...).String(...)
+      # project-local helpers, e.g. NormalizeUsername / canonicalize()
+      - patterns:
+          - pattern: $F(...)
+          - metavariable-regex:
+              metavariable: $F
+              regex: "(?i)^([A-Za-z0-9_]+\\.)?(normali[sz]e|canonicali[sz]e|nfc|nfkc|nfd|nfkd)[A-Za-z0-9_]*$"
+    pattern-sinks:
+      - patterns:
+          - pattern-either:
+              # regex-based validation
+              - pattern: regexp.MatchString($RE, $X)
+              - pattern: $RE.MatchString($X)
+              - pattern: $RE.Match($X)
+              - pattern: $RE.FindString($X)
+              - pattern: $RE.FindStringSubmatch($X)
+              # substring / prefix filters
+              - pattern: strings.Contains($X, ...)
+              - pattern: strings.ContainsAny($X, ...)
+              - pattern: strings.HasPrefix($X, ...)
+              - pattern: strings.HasSuffix($X, ...)
+              - pattern: strings.EqualFold($X, ...)
+              - pattern: strings.EqualFold(..., $X)
+              - pattern: strings.Index($X, ...)
+              # allowlist / denylist map lookups
+              - pattern: $ALLOWLIST[$X]
+              # struct validators
+              - pattern: $V.Var($X, ...)
+              - pattern: $V.VarCtx($CTX, $X, ...)
+              - pattern: $V.Struct($X)
+              - pattern: $V.StructCtx($CTX, $X)
+          - focus-metavariable: $X
+
+  # ---------------------------------------------------------------------------
+  # 2. Validate-before-canonicalize: normalization happens, but AFTER the check.
+  #    This is CWE-180 and is worse than no normalization at all, because the
+  #    stored value is not the value that was validated.
+  # ---------------------------------------------------------------------------
+  - id: go-unicode-normalization-after-validation
+    languages: [go]
+    severity: ERROR
+    message: >-
+      Input is validated and only normalized afterwards (CWE-180, validate
+      before canonicalize). The bytes that passed the check are not the bytes
+      that get stored or used, so normalization can reintroduce characters the
+      validator rejected. Normalize first, then validate the normalized value,
+      and carry the normalized value forward.
+    metadata:
+      category: security
+      subcategory: [vuln]
+      confidence: HIGH
+      likelihood: MEDIUM
+      impact: HIGH
+      technology: [go]
+      cwe:
+        - "CWE-180: Incorrect Behavior Order: Validate Before Canonicalize"
+      owasp:
+        - "A03:2021 - Injection"
+      references:
+        - https://cwe.mitre.org/data/definitions/180.html
+    pattern-either:
+      - pattern: |
+          if !$RE.MatchString($X) { ... }
+          ...
+          $Y := norm.$FORM.String($X)
+      - pattern: |
+          if !$RE.MatchString($X) { ... }
+          ...
+          $Y = norm.$FORM.String($X)
+      - pattern: |
+          if !regexp.MatchString($PAT, $X) { ... }
+          ...
+          $Y := norm.$FORM.String($X)
+      - pattern: |
+          $OK := $RE.MatchString($X)
+          ...
+          $Y := norm.$FORM.String($X)
+      - pattern: |
+          if !$RE.MatchString($X) { ... }
+          ...
+          $Y := precis.$PROFILE.String($X)
+
+  # ---------------------------------------------------------------------------
+  # 3. ASCII-only case folding used as if it were canonicalization.
+  #    strings.ToLower/ToUpper/EqualFold do simple case mapping, not NFC/NFKC,
+  #    so they do not collapse canonical or compatibility variants.
+  # ---------------------------------------------------------------------------
+  - id: go-case-folding-is-not-unicode-normalization
+    languages: [go]
+    severity: INFO
+    message: >-
+      Case folding is being used as the only canonicalization before an
+      equality / identity check. strings.ToLower, strings.ToUpper and
+      strings.EqualFold perform case mapping, not Unicode normalization, so
+      "ﬁ" (U+FB01) vs "fi", or NFC vs NFD forms of the same accented name, still
+      compare as different. Apply norm.NFKC (or precis.UsernameCaseMapped for
+      usernames) in addition to case folding.
+    metadata:
+      category: security
+      subcategory: [audit]
+      confidence: LOW
+      likelihood: LOW
+      impact: MEDIUM
+      technology: [go]
+      cwe:
+        - "CWE-178: Improper Handling of Case Sensitivity"
+      references:
+        - https://pkg.go.dev/golang.org/x/text/cases#Fold
+    patterns:
+      - pattern-either:
+          - pattern: strings.ToLower($X) == $Y
+          - pattern: $Y == strings.ToLower($X)
+          - pattern: strings.ToUpper($X) == $Y
+          - pattern: $Y == strings.ToUpper($X)
+          - pattern: strings.EqualFold($X, $Y)
+      - pattern-not-inside: |
+          func $FN(...) {
+            ...
+            norm.$FORM.String(...)
+            ...
+          }
+      - pattern-not-inside: |
+          func $FN(...) {
+            ...
+            precis.$PROFILE.String(...)
+            ...
+          }
+      - pattern-not-inside: |
+          func $FN(...) {
+            ...
+            cases.Fold(...).String(...)
+            ...
+          }
